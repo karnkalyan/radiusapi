@@ -1,12 +1,10 @@
-version: '3.8'
-
 services:
   app:
     build: .
-    ports:
-      - "3005:3005"
+    container_name: radiusapi-app-1
+    network_mode: host
     environment:
-      - DB_HOST=172.17.0.1
+      - DB_HOST=127.0.0.1
       - DB_USER=radius
       - DB_PASS=ArrowNet@DB123!@#
       - DB_PORT=3306
@@ -17,3 +15,5 @@ services:
       - JWT_TTL=1h
       - PORT=3005
       - NAS_COA_PORT=3799
+      - RADCLIENT_TIMEOUT_MS=15000
+    restart: unless-stopped
