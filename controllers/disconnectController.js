@@ -1,16 +1,41 @@
 // controllers/disconnectController.js
 const db = require('../config/db');
-const { exec } = require('child_process');
-const util = require('util');
+const { spawn } = require('child_process');
 require('dotenv').config();
 
-const execAsync = util.promisify(exec);
+function runRadclient(nasIp, coaPort, secret, payload) {
+  return new Promise((resolve) => {
+    const child = spawn('radclient', [
+      '-x',
+      `${nasIp}:${coaPort}`,
+      'disconnect',
+      secret
+    ]);
 
-// ─────────────────────────────────────────────────────────────
-// Get NAS secret + ports from nas table by IP
-// ports column = auth port (1812)
-// CoA disconnect always uses 3799
-// ─────────────────────────────────────────────────────────────
+    let output = '';
+
+    child.stdout.on('data', data => output += data.toString());
+    child.stderr.on('data', data => output += data.toString());
+
+    child.on('error', err => {
+      resolve({ success: false, code: 'ERROR', raw: err.message });
+    });
+
+    child.on('close', () => {
+      if (output.includes('Disconnect-ACK')) {
+        resolve({ success: true, code: 'ACK', raw: output });
+      } else if (output.includes('Disconnect-NAK')) {
+        resolve({ success: false, code: 'NAK', raw: output });
+      } else {
+        resolve({ success: false, code: 'NO_RESPONSE', raw: output });
+      }
+    });
+
+    child.stdin.write(payload);
+    child.stdin.end();
+  });
+}
+
 async function getNasSecret(nasIp) {
   const [rows] = await db.execute(
     `SELECT nasname, shortname, secret, ports
@@ -25,19 +50,17 @@ async function getNasSecret(nasIp) {
   }
 
   return {
-    secret:    rows[0].secret,
+    secret: rows[0].secret,
     shortname: rows[0].shortname,
-    authPort:  rows[0].ports || 1812,
-    coaPort:   parseInt(process.env.NAS_COA_PORT) || 3799
+    authPort: rows[0].ports || 1812,
+    coaPort: parseInt(process.env.NAS_COA_PORT || '3799', 10)
   };
 }
 
-// ─────────────────────────────────────────────────────────────
-// Get single active session from radacct by username
-// ─────────────────────────────────────────────────────────────
 async function getActiveSession(username) {
   const [rows] = await db.execute(
     `SELECT
+       username,
        acctsessionid,
        nasipaddress,
        framedipaddress,
@@ -55,15 +78,14 @@ async function getActiveSession(username) {
      LIMIT 1`,
     [username]
   );
+
   return rows[0] || null;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Get ALL active sessions from radacct by username
-// ─────────────────────────────────────────────────────────────
 async function getAllActiveSessions(username) {
   const [rows] = await db.execute(
     `SELECT
+       username,
        acctsessionid,
        nasipaddress,
        framedipaddress,
@@ -80,82 +102,70 @@ async function getAllActiveSessions(username) {
      ORDER BY acctstarttime DESC`,
     [username]
   );
+
   return rows;
 }
 
-// ─────────────────────────────────────────────────────────────
-// Send Disconnect-Request to NAS via radclient
-// Secret fetched from nas table dynamically
-// ─────────────────────────────────────────────────────────────
-async function sendDisconnectRequest(sessionId, username, nasIp) {
-  const { secret, coaPort, shortname } = await getNasSecret(nasIp);
+async function sendDisconnectRequest(session) {
+  const { secret, coaPort, shortname } = await getNasSecret(session.nasipaddress);
 
-  console.log(`[disconnect] NAS: ${shortname} (${nasIp}:${coaPort}) Session: ${sessionId}`);
+  const payload = [
+    `User-Name = "${session.username}"`,
+    `Acct-Session-Id = "${session.acctsessionid}"`,
+    `Framed-IP-Address = ${session.framedipaddress}`,
+    `NAS-IP-Address = ${session.nasipaddress}`
+  ].join('\n') + '\n';
 
-  const payload =
-    `Acct-Session-Id=${sessionId},` +
-    `User-Name=${username},` +
-    `NAS-IP-Address=${nasIp}`;
+  console.log(`[disconnect] NAS ${shortname} ${session.nasipaddress}:${coaPort}`);
+  console.log(`[disconnect] Session ${session.acctsessionid}`);
 
-  const cmd = `echo "${payload}" | radclient -x ${nasIp}:${coaPort} disconnect ${secret}`;
+  const result = await runRadclient(
+    session.nasipaddress,
+    coaPort,
+    secret,
+    payload
+  );
 
-  try {
-    const { stdout, stderr } = await execAsync(cmd, { timeout: 10000 });
-    const output = stdout + stderr;
-
-    console.log(`[disconnect] radclient output:\n${output}`);
-
-    if (output.includes('Disconnect-ACK')) {
-      return { success: true,  code: 'ACK', nas: shortname, raw: output };
-    } else if (output.includes('Disconnect-NAK')) {
-      return { success: false, code: 'NAK', nas: shortname, raw: output };
-    } else {
-      return { success: false, code: 'NO_RESPONSE', nas: shortname, raw: output };
-    }
-  } catch (err) {
-    console.error(`[disconnect] radclient error: ${err.message}`);
-    return { success: false, code: 'ERROR', nas: shortname, raw: err.message };
-  }
-}
-
-// ─────────────────────────────────────────────────────────────
-// Helper: Format bytes to human readable
-// ─────────────────────────────────────────────────────────────
-function formatBytes(bytes) {
-  if (!bytes || bytes === 0) return '0 B';
-  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
-  return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${sizes[i]}`;
-}
-
-// ─────────────────────────────────────────────────────────────
-// Helper: Format session for response
-// ─────────────────────────────────────────────────────────────
-function formatSession(s) {
   return {
-    session_id:   s.acctsessionid,
-    nas_ip:       s.nasipaddress,
-    framed_ip:    s.framedipaddress,
-    mac:          s.callingstationid,
-    nas_port:     s.nasportid,
-    nas_port_type:s.nasporttype,
-    started_at:   s.acctstarttime,
-    updated_at:   s.acctupdatetime,
-    data_in:      formatBytes(s.acctinputoctets),
-    data_out:     formatBytes(s.acctoutputoctets),
-    data_in_raw:  s.acctinputoctets  || 0,
-    data_out_raw: s.acctoutputoctets || 0,
+    ...result,
+    nas: shortname,
+    nas_ip: session.nasipaddress,
+    framed_ip: session.framedipaddress,
+    session_id: session.acctsessionid
   };
 }
 
-// ─────────────────────────────────────────────────────────────
-// GET /api/sessions
-// List ALL active sessions (paginated)
-// ─────────────────────────────────────────────────────────────
+function formatBytes(bytes) {
+  if (!bytes || bytes === 0) return '0 B';
+
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+
+  return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${sizes[i]}`;
+}
+
+function formatSession(s) {
+  return {
+    username: s.username,
+    session_id: s.acctsessionid,
+    nas_ip: s.nasipaddress,
+    framed_ip: s.framedipaddress,
+    mac: s.callingstationid,
+    nas_port: s.nasportid,
+    nas_port_type: s.nasporttype,
+    started_at: s.acctstarttime,
+    updated_at: s.acctupdatetime,
+    data_in: formatBytes(s.acctinputoctets),
+    data_out: formatBytes(s.acctoutputoctets),
+    data_in_raw: s.acctinputoctets || 0,
+    data_out_raw: s.acctoutputoctets || 0
+  };
+}
+
 async function listActiveSessions(req, res) {
   try {
-    const limit  = Math.min(parseInt(req.query.limit)  || 100, 1000);
-    const offset = parseInt(req.query.offset) || 0;
+    const limit = Math.min(parseInt(req.query.limit, 10) || 100, 1000);
+    const offset = parseInt(req.query.offset, 10) || 0;
 
     const [rows] = await db.execute(
       `SELECT
@@ -178,30 +188,25 @@ async function listActiveSessions(req, res) {
     );
 
     const [[{ total }]] = await db.execute(
-      `SELECT COUNT(*) as total FROM radacct WHERE acctstoptime IS NULL`
+      `SELECT COUNT(*) AS total
+       FROM radacct
+       WHERE acctstoptime IS NULL`
     );
 
     return res.json({
+      success: true,
       total,
-      count:    rows.length,
+      count: rows.length,
       limit,
       offset,
-      sessions: rows.map(formatSession).map((s, i) => ({
-        username: rows[i].username,
-        ...s
-      }))
+      sessions: rows.map(formatSession)
     });
-
   } catch (err) {
     console.error('[listActiveSessions] Error:', err);
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// GET /api/sessions/:username
-// Get active session info for a specific user
-// ─────────────────────────────────────────────────────────────
 async function getSessionInfo(req, res) {
   try {
     const { username } = req.params;
@@ -209,160 +214,121 @@ async function getSessionInfo(req, res) {
 
     if (!session) {
       return res.status(404).json({
-        online:   false,
+        success: false,
+        online: false,
         username,
-        message:  'No active session found'
+        message: 'No active session found'
       });
     }
 
     return res.json({
-      online:   true,
-      username,
+      success: true,
+      online: true,
       ...formatSession(session)
     });
-
   } catch (err) {
     console.error('[getSessionInfo] Error:', err);
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// POST /api/disconnect/:username
-// Disconnect latest active session of a user
-// ─────────────────────────────────────────────────────────────
 async function disconnectUser(req, res) {
   try {
     const { username } = req.params;
-
-    // Step 1: Get active session from radacct
     const session = await getActiveSession(username);
+
     if (!session) {
       return res.status(404).json({
-        success:  false,
-        username,
-        error:    'No active session found'
-      });
-    }
-
-    // Step 2: Fetch NAS secret from nas table + send Disconnect-Request
-    let result;
-    try {
-      result = await sendDisconnectRequest(
-        session.acctsessionid,
-        username,
-        session.nasipaddress
-      );
-    } catch (nasErr) {
-      return res.status(422).json({
         success: false,
         username,
-        error:   nasErr.message,
-        tip:     'Make sure this NAS IP exists in the nas table'
+        error: 'No active session found'
       });
     }
 
-    // Step 3: Return result
-    // NAS will send Accounting-Stop → radacct auto-updates (no manual update needed)
-    return res.status(result.success ? 200 : 502).json({
-      success:    result.success,
-      username,
-      nas:        result.nas,
-      code:       result.code,
-      session_id: session.acctsessionid,
-      nas_ip:     session.nasipaddress,
-      framed_ip:  session.framedipaddress,
-      mac:        session.callingstationid,
-      message:    result.success
-                    ? 'Session disconnected successfully'
-                    : `Disconnect failed: ${result.code}`
-    });
+    const result = await sendDisconnectRequest(session);
 
+    return res.status(result.success ? 200 : 502).json({
+      success: result.success,
+      username,
+      nas: result.nas,
+      code: result.code,
+      session_id: session.acctsessionid,
+      nas_ip: session.nasipaddress,
+      framed_ip: session.framedipaddress,
+      mac: session.callingstationid,
+      message: result.success
+        ? 'Session disconnected successfully'
+        : `Disconnect failed: ${result.code}`,
+      raw: result.raw
+    });
   } catch (err) {
     console.error('[disconnectUser] Error:', err);
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// POST /api/disconnect/:username/all
-// Disconnect ALL active sessions of a user
-// ─────────────────────────────────────────────────────────────
 async function disconnectAllSessions(req, res) {
   try {
     const { username } = req.params;
-
-    // Step 1: Get all active sessions
     const sessions = await getAllActiveSessions(username);
+
     if (!sessions.length) {
       return res.status(404).json({
-        success:  false,
+        success: false,
         username,
-        error:    'No active sessions found'
+        error: 'No active sessions found'
       });
     }
 
-    // Step 2: Send disconnect to each session concurrently
     const results = await Promise.all(
-      sessions.map(async (s) => {
+      sessions.map(async session => {
         try {
-          const r = await sendDisconnectRequest(
-            s.acctsessionid,
-            username,
-            s.nasipaddress
-          );
+          const result = await sendDisconnectRequest(session);
+
           return {
-            session_id: s.acctsessionid,
-            nas_ip:     s.nasipaddress,
-            nas:        r.nas,
-            framed_ip:  s.framedipaddress,
-            mac:        s.callingstationid,
-            success:    r.success,
-            code:       r.code
+            success: result.success,
+            code: result.code,
+            session_id: session.acctsessionid,
+            nas_ip: session.nasipaddress,
+            framed_ip: session.framedipaddress,
+            mac: session.callingstationid,
+            nas: result.nas,
+            raw: result.raw
           };
         } catch (err) {
           return {
-            session_id: s.acctsessionid,
-            nas_ip:     s.nasipaddress,
-            framed_ip:  s.framedipaddress,
-            success:    false,
-            code:       'NAS_NOT_FOUND',
-            error:      err.message
+            success: false,
+            code: 'ERROR',
+            session_id: session.acctsessionid,
+            nas_ip: session.nasipaddress,
+            framed_ip: session.framedipaddress,
+            error: err.message
           };
         }
       })
     );
 
-    const successCount = results.filter(r => r.success).length;
-    const failCount    = results.filter(r => !r.success).length;
+    const disconnected = results.filter(r => r.success).length;
+    const failed = results.length - disconnected;
 
-    return res.status(200).json({
+    return res.json({
+      success: disconnected > 0,
       username,
-      total:         results.length,
-      disconnected:  successCount,
-      failed:        failCount,
-      success:       successCount > 0,
-      sessions:      results,
-      message:       successCount === results.length
-                       ? 'All sessions disconnected successfully'
-                       : `${successCount}/${results.length} sessions disconnected`
+      total: results.length,
+      disconnected,
+      failed,
+      sessions: results
     });
-
   } catch (err) {
     console.error('[disconnectAllSessions] Error:', err);
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// POST /api/disconnect/session/:sessionId
-// Disconnect by exact session ID
-// ─────────────────────────────────────────────────────────────
 async function disconnectBySessionId(req, res) {
   try {
     const { sessionId } = req.params;
 
-    // Lookup session in radacct
     const [rows] = await db.execute(
       `SELECT
          username,
@@ -380,52 +346,34 @@ async function disconnectBySessionId(req, res) {
     if (!rows.length) {
       return res.status(404).json({
         success: false,
-        error:   'Session not found or already stopped',
+        error: 'Session not found or already stopped',
         sessionId
       });
     }
 
     const session = rows[0];
-
-    let result;
-    try {
-      result = await sendDisconnectRequest(
-        session.acctsessionid,
-        session.username,
-        session.nasipaddress
-      );
-    } catch (nasErr) {
-      return res.status(422).json({
-        success: false,
-        error:   nasErr.message,
-        tip:     'Make sure this NAS IP exists in the nas table'
-      });
-    }
+    const result = await sendDisconnectRequest(session);
 
     return res.status(result.success ? 200 : 502).json({
-      success:    result.success,
-      username:   session.username,
-      nas:        result.nas,
-      code:       result.code,
+      success: result.success,
+      username: session.username,
+      nas: result.nas,
+      code: result.code,
       session_id: session.acctsessionid,
-      nas_ip:     session.nasipaddress,
-      framed_ip:  session.framedipaddress,
-      mac:        session.callingstationid,
-      message:    result.success
-                    ? 'Session disconnected successfully'
-                    : `Disconnect failed: ${result.code}`
+      nas_ip: session.nasipaddress,
+      framed_ip: session.framedipaddress,
+      mac: session.callingstationid,
+      message: result.success
+        ? 'Session disconnected successfully'
+        : `Disconnect failed: ${result.code}`,
+      raw: result.raw
     });
-
   } catch (err) {
     console.error('[disconnectBySessionId] Error:', err);
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 }
 
-// ─────────────────────────────────────────────────────────────
-// GET /api/nas
-// List all NAS devices from nas table
-// ─────────────────────────────────────────────────────────────
 async function listNasDevices(req, res) {
   try {
     const [rows] = await db.execute(
@@ -433,11 +381,15 @@ async function listNasDevices(req, res) {
        FROM nas
        ORDER BY id ASC`
     );
-    // Note: secret is intentionally excluded from response
-    return res.json({ total: rows.length, nas: rows });
+
+    return res.json({
+      success: true,
+      total: rows.length,
+      nas: rows
+    });
   } catch (err) {
     console.error('[listNasDevices] Error:', err);
-    res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({ success: false, error: err.message });
   }
 }
 

@@ -16,3 +16,4 @@ services:
       - JWT_SECRET=freeradius@123Secret
       - JWT_TTL=1h
       - PORT=3005
+      - NAS_COA_PORT=3799
